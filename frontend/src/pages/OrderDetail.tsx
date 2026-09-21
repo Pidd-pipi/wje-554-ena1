@@ -2,6 +2,7 @@ import { Box, Button, Card, CardContent, Grid, Stack, TextField, Typography } fr
 import { useEffect, useMemo, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import { OrderStatus, UserRole } from '../constants/enums';
+import { canCancelOrder, canOrderTransition, canRateOrder } from '../constants/orderFlow';
 import { OrderStatusFlow } from '../components/common/OrderStatusFlow';
 import { PageHeader } from '../components/common/PageHeader';
 import { RatingStars } from '../components/common/RatingStars';
@@ -9,6 +10,13 @@ import { StatusBadge } from '../components/common/StatusBadge';
 import { useAuthStore } from '../stores/authStore';
 import { useOrderStore } from '../stores/orderStore';
 import { datetime, money } from '../utils/format';
+
+const workerSteps: [OrderStatus, string][] = [
+  [OrderStatus.ACCEPTED, '接单'],
+  [OrderStatus.ON_THE_WAY, '出发'],
+  [OrderStatus.IN_PROGRESS, '开始服务'],
+  [OrderStatus.COMPLETED, '完工']
+];
 
 export function OrderDetail() {
   const { id = '' } = useParams();
@@ -22,17 +30,16 @@ export function OrderDetail() {
   const actions = useMemo(() => {
     if (!current) return [];
     if (role === UserRole.WORKER) {
-      const map: Partial<Record<OrderStatus, [string, OrderStatus]>> = {
-        [OrderStatus.ASSIGNED]: ['接单', OrderStatus.ACCEPTED],
-        [OrderStatus.ACCEPTED]: ['出发', OrderStatus.ON_THE_WAY],
-        [OrderStatus.ON_THE_WAY]: ['开始服务', OrderStatus.IN_PROGRESS],
-        [OrderStatus.IN_PROGRESS]: ['完工', OrderStatus.COMPLETED]
-      };
-      return map[current.status] ? [map[current.status]!] : [];
+      return workerSteps.filter(([next]) => canOrderTransition(current.status, next)).map(([next, label]) => [label, next] as [string, OrderStatus]);
     }
-    if (role === UserRole.ADMIN && current.status === OrderStatus.PENDING) return [['派单给默认技师', OrderStatus.ASSIGNED] as [string, OrderStatus]];
+    if (role === UserRole.ADMIN && canOrderTransition(current.status, OrderStatus.ASSIGNED)) return [['派单给默认技师', OrderStatus.ASSIGNED] as [string, OrderStatus]];
     return [];
   }, [current, role]);
+
+  // 失败时全局 Toast 已展示后端返回的失败原因，这里刷新详情，让页面回到真实状态
+  const runAction = (action: () => Promise<unknown>) => {
+    action().catch(() => loadOrder(id).catch(() => undefined));
+  };
 
   if (!current) return null;
 
@@ -53,8 +60,8 @@ export function OrderDetail() {
             </Grid>
             <Box sx={{ my: 4, overflowX: 'auto' }}><OrderStatusFlow status={current.status} /></Box>
             <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
-              {actions.map(([label, next]) => <Button key={next} variant="contained" onClick={() => updateStatus(current.id, next)}>{label}</Button>)}
-              {role !== UserRole.WORKER && ![OrderStatus.CANCELLED, OrderStatus.RATED].includes(current.status) && <Button color="error" variant="outlined" onClick={() => cancel(current.id, '用户取消')}>取消订单</Button>}
+              {actions.map(([label, next]) => <Button key={next} variant="contained" onClick={() => runAction(() => updateStatus(current.id, next))}>{label}</Button>)}
+              {role !== UserRole.WORKER && canCancelOrder(current.status) && <Button color="error" variant="outlined" onClick={() => runAction(() => cancel(current.id, '用户取消'))}>取消订单</Button>}
             </Stack>
           </CardContent></Card>
         </Grid>
@@ -65,11 +72,11 @@ export function OrderDetail() {
           </CardContent></Card>
           <Card><CardContent>
             <Typography variant="h6">评价</Typography>
-            {current.status === OrderStatus.COMPLETED && role === UserRole.CUSTOMER ? (
+            {canRateOrder(current.status) && role === UserRole.CUSTOMER ? (
               <Stack spacing={2} sx={{ mt: 2 }}>
                 <RatingStars value={rating} onChange={setRating} />
                 <TextField multiline minRows={3} value={comment} onChange={(e) => setComment(e.target.value)} />
-                <Button variant="contained" onClick={() => rate(current.id, rating, comment)}>提交评价</Button>
+                <Button variant="contained" onClick={() => runAction(() => rate(current.id, rating, comment))}>提交评价</Button>
               </Stack>
             ) : current.rating ? (
               <Stack spacing={1} sx={{ mt: 2 }}><RatingStars value={current.rating} readOnly /><Typography>{current.comment}</Typography></Stack>

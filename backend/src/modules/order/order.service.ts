@@ -1,21 +1,12 @@
 import { ForbiddenException, Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
-import { OrderStatus, UserRole } from '../../constants/enums';
+import { OrderStatus, ServiceStatus, UserRole } from '../../constants/enums';
 import { orders, services, users, workers } from '../demo-data';
 import { NotificationService } from '../notification/notification.service';
 import { WorkerService } from '../worker/worker.service';
 import { CreateOrderDto } from './dto/create-order.dto';
 import { OrderEntity } from './entities/order.entity';
-
-const transitions: Record<OrderStatus, OrderStatus[]> = {
-  [OrderStatus.PENDING]: [OrderStatus.ASSIGNED, OrderStatus.CANCELLED],
-  [OrderStatus.ASSIGNED]: [OrderStatus.ACCEPTED, OrderStatus.CANCELLED],
-  [OrderStatus.ACCEPTED]: [OrderStatus.ON_THE_WAY, OrderStatus.CANCELLED],
-  [OrderStatus.ON_THE_WAY]: [OrderStatus.IN_PROGRESS, OrderStatus.CANCELLED],
-  [OrderStatus.IN_PROGRESS]: [OrderStatus.COMPLETED, OrderStatus.CANCELLED],
-  [OrderStatus.COMPLETED]: [OrderStatus.RATED],
-  [OrderStatus.RATED]: [],
-  [OrderStatus.CANCELLED]: []
-};
+import { WorkerEntity } from '../worker/entities/worker.entity';
+import { assertOrderTransition, INITIAL_ORDER_STATUS } from './order.state-machine';
 
 @Injectable()
 export class OrderService {
@@ -41,6 +32,7 @@ export class OrderService {
     if (user.role !== UserRole.CUSTOMER) throw new ForbiddenException('仅 Customer 可下单');
     const service = services.find((item) => item.id === dto.serviceItemId);
     if (!service) throw new NotFoundException('服务项目不存在');
+    if (service.status !== ServiceStatus.ACTIVE) throw new BadRequestException('服务项目已下架，暂不能下单');
     const order: OrderEntity = {
       id: crypto.randomUUID(),
       orderNo: `HS-${new Date().toISOString().slice(0, 10).replaceAll('-', '')}-${String(orders.length + 1).padStart(4, '0')}`,
@@ -50,29 +42,31 @@ export class OrderService {
       addressDetail: dto.addressDetail,
       contactPhone: dto.contactPhone,
       scheduledTime: dto.scheduledTime,
-      status: OrderStatus.PENDING,
+      status: INITIAL_ORDER_STATUS,
       totalPrice: dto.totalPrice || service.basePrice,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     };
     orders.unshift(order);
-    service.orderCount += 1;
     this.notification.notify({ type: 'order:status_changed', title: '新订单待派单', message: order.orderNo, orderId: order.id });
     return this.hydrate(order);
   }
 
   updateStatus(user: { sub: string; role: UserRole }, id: string, status: OrderStatus, workerId?: string) {
     const order = this.mustFind(id);
-    if (!transitions[order.status].includes(status)) throw new BadRequestException(`订单不能从 ${order.status} 流转到 ${status}`);
+    if (status === OrderStatus.CANCELLED || status === OrderStatus.RATED) {
+      throw new BadRequestException(status === OrderStatus.CANCELLED ? '取消订单请使用取消接口' : '评价订单请使用评价接口');
+    }
+    assertOrderTransition(order.status, status);
     if (status === OrderStatus.ASSIGNED) {
       if (user.role !== UserRole.ADMIN) throw new ForbiddenException('仅 Admin 可派单');
-      order.workerId = workerId || this.workerService.firstOnline().id;
+      const worker = workerId ? this.workerService.detail(workerId) : this.workerService.firstOnline();
+      order.workerId = worker.id;
     } else if ([OrderStatus.ACCEPTED, OrderStatus.ON_THE_WAY, OrderStatus.IN_PROGRESS, OrderStatus.COMPLETED].includes(status)) {
       const worker = this.workerService.findByUserId(user.sub);
       if (user.role !== UserRole.WORKER || !worker || worker.id !== order.workerId) throw new ForbiddenException('仅订单技师可更新该状态');
       if (status === OrderStatus.COMPLETED) {
-        order.actualDuration = 96;
-        worker.totalOrders += 1;
+        this.applyCompletionStats(order, worker);
       }
     }
     order.status = status;
@@ -90,11 +84,12 @@ export class OrderService {
   rate(user: { sub: string; role: UserRole }, id: string, rating: number, comment: string) {
     const order = this.mustFind(id);
     if (user.role !== UserRole.CUSTOMER || order.customerId !== user.sub) throw new ForbiddenException('仅订单客户可评价');
-    if (order.status !== OrderStatus.COMPLETED) throw new BadRequestException('仅已完工订单可评价');
+    assertOrderTransition(order.status, OrderStatus.RATED);
     order.rating = rating;
     order.comment = comment;
     order.status = OrderStatus.RATED;
     order.updatedAt = new Date().toISOString();
+    this.recalculateWorkerRating(order.workerId);
     return this.hydrate(order);
   }
 
@@ -103,11 +98,33 @@ export class OrderService {
     if (![UserRole.ADMIN, UserRole.CUSTOMER].includes(user.role) || (user.role === UserRole.CUSTOMER && order.customerId !== user.sub)) {
       throw new ForbiddenException('无权取消该订单');
     }
-    if (order.status === OrderStatus.RATED) throw new BadRequestException('已评价订单不能取消');
+    assertOrderTransition(order.status, OrderStatus.CANCELLED);
     order.status = OrderStatus.CANCELLED;
     order.cancelReason = reason;
     order.updatedAt = new Date().toISOString();
     return this.hydrate(order);
+  }
+
+  /**
+   * 订单首次进入已完成状态时计入统计：服务项目订单量 +1、技师完成单数 +1。
+   * 状态机保证只有 IN_PROGRESS -> COMPLETED 唯一入口，重复提交完工会在流转校验处失败，不会重复累计。
+   */
+  private applyCompletionStats(order: OrderEntity, worker: WorkerEntity) {
+    order.actualDuration = 96;
+    worker.totalOrders += 1;
+    const service = services.find((item) => item.id === order.serviceItemId);
+    if (service) service.orderCount += 1;
+  }
+
+  /** 客户首次评价后，按该技师全部已评分订单重新计算平均分 */
+  private recalculateWorkerRating(workerId?: string) {
+    if (!workerId) return;
+    const worker = workers.find((item) => item.id === workerId);
+    if (!worker) return;
+    const rated = orders.filter((order) => order.workerId === workerId && typeof order.rating === 'number');
+    if (!rated.length) return;
+    const average = rated.reduce((sum, order) => sum + (order.rating as number), 0) / rated.length;
+    worker.rating = Math.round(average * 10) / 10;
   }
 
   private mustFind(id: string) {
